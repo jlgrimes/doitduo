@@ -1,20 +1,20 @@
-import { getUpdates } from "@/lib/apple";
-import UpdatesList from "./updates-list";
+import { getFeed } from "@/lib/feed";
+import FeedList from "./feed-list";
 
-export const revalidate = 1800; // re-scrape every 30 minutes
+// Rendered per request from a 30-minute cache, so the first build doesn't
+// have to scrape and run the AI.
+export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 export default async function Home() {
-  const { updates, checkedAt, appsScanned } = await getUpdates();
-
+  const feed = await getFeed();
   return (
     <main>
       <header>
         <h1>App Updates</h1>
-        <p className="sub">
-          When popular App Store apps ship new versions. Tracking {appsScanned} apps.
-        </p>
+        <p className="sub">Who shipped what, found across tech news, company blogs and the App Store, with a confidence score for each.</p>
       </header>
-      <UpdatesList updates={updates} checkedAt={checkedAt} />
+      <FeedList feed={feed} />
     </main>
   );
 }

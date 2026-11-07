@@ -90,21 +90,38 @@ async function lookup(ids: string[]): Promise<AppUpdate[]> {
       continue;
     }
     for (const r of s.value) {
-      if (!r?.trackId || !r.currentVersionReleaseDate) continue;
-      apps.push({
-        id: r.trackId,
-        name: r.trackName,
-        developer: r.artistName ?? r.sellerName ?? "",
-        version: r.version ?? "",
-        releasedAt: r.currentVersionReleaseDate,
-        notes: (r.releaseNotes ?? "").trim(),
-        icon: r.artworkUrl100 ?? r.artworkUrl60 ?? "",
-        url: r.trackViewUrl ?? `https://apps.apple.com/app/id${r.trackId}`,
-        genre: r.primaryGenreName ?? "",
-      });
+      const app = toApp(r);
+      if (app) apps.push(app);
     }
   }
   return apps;
+}
+
+function toApp(r: any): AppUpdate | null {
+  if (!r?.trackId || !r.currentVersionReleaseDate) return null;
+  return {
+    id: r.trackId,
+    name: r.trackName,
+    developer: r.artistName ?? r.sellerName ?? "",
+    version: r.version ?? "",
+    releasedAt: r.currentVersionReleaseDate,
+    notes: (r.releaseNotes ?? "").trim(),
+    icon: r.artworkUrl100 ?? r.artworkUrl60 ?? "",
+    url: r.trackViewUrl ?? `https://apps.apple.com/app/id${r.trackId}`,
+    genre: r.primaryGenreName ?? "",
+  };
+}
+
+/** Search the App Store by name; returns the top few apps. */
+export async function searchApps(term: string): Promise<AppUpdate[]> {
+  const url = `https://itunes.apple.com/search?country=${COUNTRY}&entity=software&limit=5&term=${encodeURIComponent(term)}`;
+  const res = await fetch(url, {
+    next: { revalidate: 6 * 3600 },
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+  const data = (await res.json()) as any;
+  return ((data?.results ?? []) as any[]).map(toApp).filter((a): a is AppUpdate => !!a);
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
