@@ -169,3 +169,38 @@ export async function classifyAll(articles: Article[], concurrency = 10) {
   if (failed) console.error(`AI step failed for ${failed}/${articles.length} articles. First error: ${firstError}`);
   return { results: out, failed };
 }
+
+// ---------- 3. App Store listing check ----------
+
+const LISTING_QUESTIONS = {
+  sameApp: {
+    type: "boolean",
+    instructions:
+      "Is this App Store listing the app the news is about? A new feature inside that app counts. A different app that merely shares a word in its name, an operating system, a website, a desktop-only program or a developer API does not.",
+  },
+} as const;
+
+/**
+ * Jev's probability that an App Store listing is the app an update is about.
+ * Cached per (app, listing).
+ */
+export function confirmListing(
+  update: { app: string; company: string; summary: string; headline: string },
+  listing: { id: number; name: string; developer: string; genre: string },
+): Promise<number> {
+  return unstable_cache(
+    async () => {
+      const result = await decide({
+        model: DECISION_MODEL,
+        state: { news: update, appStoreListing: listing },
+        questions: LISTING_QUESTIONS,
+        maxRetries: 1,
+        abortSignal: AbortSignal.timeout(30_000),
+        providerOptions: { gateway: { models: [ESCALATION_MODEL] } satisfies GatewayProviderOptions },
+      });
+      return result.answers.sameApp.probability;
+    },
+    ["listing", "v1", update.app.toLowerCase(), String(listing.id)],
+    { revalidate: CACHE_SECONDS },
+  )();
+}

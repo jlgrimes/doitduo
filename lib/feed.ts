@@ -5,7 +5,7 @@
 import { unstable_cache } from "next/cache";
 import { getUpdates, searchApps, type AppUpdate } from "./apple";
 import { getCandidateArticles, type Article } from "./articles";
-import { classifyAll, STATUSES, type Extraction, type Judgment, type Status } from "./classify";
+import { classifyAll, confirmListing, STATUSES, type Extraction, type Judgment, type Status } from "./classify";
 import type { SourceKind } from "./sources";
 
 export type Signal = { label: string; value: string; tone: "pos" | "neg" | "zero" };
@@ -47,7 +47,8 @@ export type Feed = {
 const DAY = 864e5;
 const CLUSTER_GAP = 3 * DAY;
 const APPSTORE_WINDOW = 7 * DAY;
-const MAX_APP_SEARCHES = 30;
+const MAX_APP_SEARCHES = 80;
+const MIN_SAME_APP = 0.5; // Jev must be at least this sure the listing is the app
 
 // ---------- name matching ----------
 
@@ -72,10 +73,6 @@ function namesMatch(storeName: string, appName: string) {
   if (!store || !app) return false;
   return store === app || (app.length >= 4 && store.startsWith(app + " "));
 }
-
-/** Only native-app platforms can be corroborated by the iOS App Store. */
-const couldBeOnAppStore = (platforms: string[]) =>
-  platforms.length === 0 || platforms.some((p) => p === "ios" || p === "other");
 
 // ---------- confidence ----------
 //
@@ -205,10 +202,9 @@ async function buildFeed(): Promise<Feed> {
     if (cur.length) groups.push(cur);
   }
 
-  // App Store lookup per app: chart pool first, then search (capped).
-  const appNames = [
-    ...new Set(groups.filter((g) => couldBeOnAppStore(g.flatMap((t) => t.x.platforms))).map(appNameOf)),
-  ];
+  // Only App Store apps are shown. Find each app's listing: chart pool first,
+  // then App Store search (capped).
+  const appNames = [...new Set(groups.map(appNameOf))];
   const storeMatch = new Map<string, AppUpdate | null>();
   const toSearch: string[] = [];
   for (const name of appNames) {
@@ -231,18 +227,46 @@ async function buildFeed(): Promise<Feed> {
     }),
   );
 
+  // Have Jev confirm each listing is really the app the news is about, so
+  // "iOS" or "Windows 11" can't match some unrelated app with a similar name.
+  const listed: { group: Tagged[]; store: AppUpdate; pSame: number }[] = [];
+  let gi = 0;
+  await Promise.all(
+    Array.from({ length: 8 }, async () => {
+      while (gi < groups.length) {
+        const group = groups[gi++];
+        const store = storeMatch.get(appNameOf(group));
+        if (!store) continue;
+        const lead = group[0];
+        try {
+          const pSame = await confirmListing(
+            { app: appNameOf(group), company: lead.x.company, summary: lead.x.summary, headline: lead.article.title },
+            { id: store.id, name: store.name, developer: store.developer, genre: store.genre },
+          );
+          if (pSame >= MIN_SAME_APP) listed.push({ group, store, pSame });
+        } catch (e) {
+          console.warn(`listing check failed for ${store.name}:`, e instanceof Error ? e.message : e);
+        }
+      }
+    }),
+  );
+
   const matchedStoreIds = new Set<number>();
-  const reported: FeedItem[] = groups.map((group) => {
+  const reported: FeedItem[] = listed.map(({ group, store, pSame }) => {
     const first = group[0];
     const firstAt = Date.parse(first.article.publishedAt);
     const appName = appNameOf(group);
-    const store = storeMatch.get(appName) ?? null;
     const rel = store ? Date.parse(store.releasedAt) : NaN;
     // New App Store version within 5 days before / 3 days after the first report
-    const appStoreHit = !!store && rel >= firstAt - 5 * DAY && rel <= firstAt + 3 * DAY;
-    if (store && appStoreHit) matchedStoreIds.add(store.id);
+    const appStoreHit = rel >= firstAt - 5 * DAY && rel <= firstAt + 3 * DAY;
+    if (appStoreHit) matchedStoreIds.add(store.id);
 
     const { signals, confidence, status } = score(group, appStoreHit ? store : null);
+    signals.push({
+      label: `Jev: ${pct(pSame)} sure the App Store app is "${store.name}" by ${store.developer}`,
+      value: "",
+      tone: "zero",
+    });
     const lead =
       group.find((g) => g.article.sourceKind === "first-party") ??
       [...group].sort((a, b) => b.j.pUpdate * pLive(b.j) - a.j.pUpdate * pLive(a.j))[0];
@@ -253,14 +277,12 @@ async function buildFeed(): Promise<Feed> {
       app: appName,
       company: lead.x.company,
       summary: lead.x.summary,
-      version: group.map((g) => g.x.version).find(Boolean) ?? (appStoreHit ? store!.version : ""),
+      version: group.map((g) => g.x.version).find(Boolean) ?? (appStoreHit ? store.version : ""),
       status,
       platforms: [...new Set(group.flatMap((g) => g.x.platforms))],
       time: first.article.publishedAt,
       firstReportedAt: first.article.publishedAt,
-      appStore: store
-        ? { name: store.name, version: store.version, releasedAt: store.releasedAt, url: store.url, icon: store.icon, notes: store.notes }
-        : null,
+      appStore: { name: store.name, version: store.version, releasedAt: store.releasedAt, url: store.url, icon: store.icon, notes: store.notes },
       articles: group.map(({ article: a }) => ({
         title: a.title,
         url: a.url,
@@ -313,4 +335,4 @@ async function buildFeed(): Promise<Feed> {
   };
 }
 
-export const getFeed = unstable_cache(buildFeed, ["feed", "jev-v2"], { revalidate: 1800 });
+export const getFeed = unstable_cache(buildFeed, ["feed", "appstore-only-v1"], { revalidate: 1800 });

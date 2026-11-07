@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "App Updates",
-  description: "Who shipped what: app updates found across tech news, company blogs and the App Store, with confidence scores.",
+  description: "Updates to App Store apps, found in tech news and company blogs, with confidence scores.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

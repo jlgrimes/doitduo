@@ -152,7 +152,8 @@ export default function FeedList({ feed }: { feed: Feed }) {
       ))}
 
       <footer>
-        Confidence is the probability that an update is real and live. Jev (TypeSafe AI&apos;s decision model, via Vercel AI
+        Only apps with an App Store listing are shown: every reported update is matched to its App Store app, and Jev confirms
+        the match. Confidence is the probability that an update is real and live. Jev (TypeSafe AI&apos;s decision model, via Vercel AI
         Gateway) judges every article: is it an app update, and is it shipped, rolling out, in beta, announced or a rumor? When
         Jev is unsure, the gateway re-asks Claude Sonnet. Independent sources are combined, official blogs count most, and a
         matching App Store release adds to it. Times are when the update was first reported, or Apple&apos;s release time for

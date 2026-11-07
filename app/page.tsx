@@ -12,7 +12,7 @@ export default async function Home() {
     <main>
       <header>
         <h1>App Updates</h1>
-        <p className="sub">Who shipped what, found across tech news, company blogs and the App Store, with a confidence score for each.</p>
+        <p className="sub">Updates to App Store apps, found in tech news and company blogs and checked against the App Store, with a confidence score for each.</p>
       </header>
       <FeedList feed={feed} />
     </main>
