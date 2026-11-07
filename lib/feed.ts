@@ -97,6 +97,9 @@ const level = (c: number): Level => (c >= 75 ? "high" : c >= 50 ? "medium" : "lo
 
 type Tagged = { article: Article; j: Judgment; x: Extraction };
 
+/** The group's app name: the shortest one, i.e. the parent app after merging. */
+const appNameOf = (group: Tagged[]) => group.map((t) => t.x.app).sort((a, b) => a.length - b.length)[0];
+
 function score(group: Tagged[], appStoreHit: AppUpdate | null) {
   // Best evidence per publisher (reposts on one outlet aren't independent).
   const perPublisher = new Map<string, { t: Tagged; p: number }>();
@@ -167,6 +170,26 @@ async function buildFeed(): Promise<Feed> {
     if (!byApp.has(k)) byApp.set(k, []);
     byApp.get(k)!.push(t);
   }
+  // Merge feature-named apps into their parent from the same company
+  // ("Claude Personal Finance" -> "Claude"). A parent named after the company
+  // itself is skipped, so "Google Maps" doesn't fold into "Google", and so is
+  // any name that is its own App Store app ("Apple Music Classical").
+  const storeNames = new Set(chart.updates.map((u) => normalizeName(u.name)));
+  const companyOf = (list: Tagged[]) =>
+    normalizeName(list.find((t) => t.x.company)?.x.company ?? "").split(" ")[0] ?? "";
+  for (const k of [...byApp.keys()].sort((a, b) => b.length - a.length)) {
+    const co = companyOf(byApp.get(k)!);
+    if (!co || storeNames.has(k)) continue;
+    const parent = [...byApp.keys()]
+      .filter((p) => p !== k && p.length >= 3 && k.startsWith(p + " ") && p !== co)
+      .sort((a, b) => b.length - a.length)
+      .find((p) => companyOf(byApp.get(p)!) === co);
+    if (parent) {
+      byApp.get(parent)!.push(...byApp.get(k)!);
+      byApp.delete(k);
+    }
+  }
+
   const groups: Tagged[][] = [];
   for (const list of byApp.values()) {
     list.sort((a, b) => Date.parse(a.article.publishedAt) - Date.parse(b.article.publishedAt));
@@ -184,7 +207,7 @@ async function buildFeed(): Promise<Feed> {
 
   // App Store lookup per app: chart pool first, then search (capped).
   const appNames = [
-    ...new Set(groups.filter((g) => couldBeOnAppStore(g.flatMap((t) => t.x.platforms))).map((g) => g[0].x.app)),
+    ...new Set(groups.filter((g) => couldBeOnAppStore(g.flatMap((t) => t.x.platforms))).map(appNameOf)),
   ];
   const storeMatch = new Map<string, AppUpdate | null>();
   const toSearch: string[] = [];
@@ -212,7 +235,8 @@ async function buildFeed(): Promise<Feed> {
   const reported: FeedItem[] = groups.map((group) => {
     const first = group[0];
     const firstAt = Date.parse(first.article.publishedAt);
-    const store = storeMatch.get(first.x.app) ?? null;
+    const appName = appNameOf(group);
+    const store = storeMatch.get(appName) ?? null;
     const rel = store ? Date.parse(store.releasedAt) : NaN;
     // New App Store version within 5 days before / 3 days after the first report
     const appStoreHit = !!store && rel >= firstAt - 5 * DAY && rel <= firstAt + 3 * DAY;
@@ -224,9 +248,9 @@ async function buildFeed(): Promise<Feed> {
       [...group].sort((a, b) => b.j.pUpdate * pLive(b.j) - a.j.pUpdate * pLive(a.j))[0];
 
     return {
-      key: `r:${normalizeName(first.x.app)}:${first.article.id}`,
+      key: `r:${normalizeName(appName)}:${first.article.id}`,
       kind: "reported",
-      app: lead.x.app,
+      app: appName,
       company: lead.x.company,
       summary: lead.x.summary,
       version: group.map((g) => g.x.version).find(Boolean) ?? (appStoreHit ? store!.version : ""),
@@ -289,4 +313,4 @@ async function buildFeed(): Promise<Feed> {
   };
 }
 
-export const getFeed = unstable_cache(buildFeed, ["feed", "jev-v1"], { revalidate: 1800 });
+export const getFeed = unstable_cache(buildFeed, ["feed", "jev-v2"], { revalidate: 1800 });

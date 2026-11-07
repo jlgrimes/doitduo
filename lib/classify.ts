@@ -19,7 +19,8 @@ import type { Article } from "./articles";
 export const DECISION_MODEL = process.env.DECISION_MODEL ?? "typesafe-ai/jev";
 export const ESCALATION_MODEL = "anthropic/claude-sonnet-5.5";
 const EXTRACT_MODEL = process.env.AI_MODEL ?? "anthropic/claude-haiku-5.5";
-const VERSION = "jev-v1"; // bump to re-process everything
+const JUDGE_VERSION = "jev-v1"; // bump to re-run Jev on everything
+const EXTRACT_VERSION = "x-v2"; // bump to re-run extraction
 const CACHE_SECONDS = 14 * 86400;
 const MIN_P_UPDATE = 0.3; // below this we don't bother extracting
 
@@ -112,7 +113,11 @@ async function judgeUncached(a: Article): Promise<Judgment> {
 // ---------- 2. Extraction ----------
 
 const Extraction = z.object({
-  app: z.string().describe("Canonical app/product name, e.g. 'WhatsApp', 'ChatGPT', 'Google Maps'. Empty if none."),
+  app: z
+    .string()
+    .describe(
+      "The app or product itself, not the feature: 'Claude' (not 'Claude Personal Finance'), 'WhatsApp' (not 'WhatsApp message translation'), 'GitHub Copilot' (not 'Copilot code review'), 'Google Maps'. Empty if none.",
+    ),
   company: z.string().describe("Company that makes it. Empty if unknown."),
   platforms: z.array(z.enum(["ios", "android", "web", "mac", "windows", "linux", "other"])),
   version: z.string().describe("Version number if stated, else empty."),
@@ -135,8 +140,8 @@ async function extractUncached(a: Article): Promise<Extraction> {
 
 // ---------- caching + batching ----------
 
-const cached = <T>(kind: string, a: Article, fn: () => Promise<T>) =>
-  unstable_cache(fn, [kind, VERSION, a.id], { revalidate: CACHE_SECONDS })();
+const cached = <T>(kind: string, version: string, a: Article, fn: () => Promise<T>) =>
+  unstable_cache(fn, [kind, version, a.id], { revalidate: CACHE_SECONDS })();
 
 export type Classified = { judgment: Judgment; extraction: Extraction | null };
 
@@ -150,9 +155,9 @@ export async function classifyAll(articles: Article[], concurrency = 10) {
       while (i < articles.length) {
         const a = articles[i++];
         try {
-          const judgment = await cached("judge", a, () => judgeUncached(a));
+          const judgment = await cached("judge", JUDGE_VERSION, a, () => judgeUncached(a));
           const extraction =
-            judgment.pUpdate >= MIN_P_UPDATE ? await cached("extract", a, () => extractUncached(a)) : null;
+            judgment.pUpdate >= MIN_P_UPDATE ? await cached("extract", EXTRACT_VERSION, a, () => extractUncached(a)) : null;
           out.set(a.id, { judgment, extraction });
         } catch (e) {
           failed++;
