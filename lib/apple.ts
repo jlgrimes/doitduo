@@ -41,6 +41,7 @@ const CHART_FEEDS_LEGACY = [
 async function getJson(url: string): Promise<unknown> {
   const res = await fetch(url, {
     next: { revalidate: REVALIDATE },
+    signal: AbortSignal.timeout(10_000), // one slow feed shouldn't stall the page
     headers: { "User-Agent": "doitduo-app-updates/1.0" },
   });
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
