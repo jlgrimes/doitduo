@@ -40,5 +40,4 @@ export const SOURCES: Source[] = [
   { name: "Google News", url: googleNews('app "new update" when:3d'), kind: "aggregator" },
   { name: "Google News", url: googleNews('app "rolling out" when:3d'), kind: "aggregator" },
   { name: "Google News", url: googleNews('app "latest version" OR "now available" when:3d'), kind: "aggregator" },
-  { name: "Hacker News", url: "https://hnrss.org/newest?q=release+OR+update+OR+changelog+OR+launch&points=40", kind: "aggregator" },
 ];

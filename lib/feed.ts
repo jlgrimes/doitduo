@@ -59,14 +59,21 @@ export function normalizeName(s: string) {
     .trim();
 }
 
-function namesMatch(a: string, b: string) {
-  const x = normalizeName(a);
-  const y = normalizeName(b);
-  if (!x || !y) return false;
-  if (x === y) return true;
-  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
-  return short.length >= 4 && long.startsWith(short + " ");
+/**
+ * Does an App Store listing name refer to the app named in an article?
+ * The store name may add words ("WhatsApp Messenger" for "WhatsApp"), but the
+ * article's app may not ("GitHub Copilot code review" is not the "GitHub" app).
+ */
+function namesMatch(storeName: string, appName: string) {
+  const store = normalizeName(storeName);
+  const app = normalizeName(appName);
+  if (!store || !app) return false;
+  return store === app || (app.length >= 4 && store.startsWith(app + " "));
 }
+
+/** Only native-app platforms can be corroborated by the iOS App Store. */
+const couldBeOnAppStore = (platforms: string[]) =>
+  platforms.length === 0 || platforms.some((p) => p === "ios" || p === "other");
 
 // ---------- scoring ----------
 
@@ -148,7 +155,9 @@ async function buildFeed(): Promise<Feed> {
   }
 
   // App Store lookup per app: chart pool first, then search (capped).
-  const appNames = [...new Set(groups.map((g) => g[0].c.app))];
+  const appNames = [
+    ...new Set(groups.filter((g) => couldBeOnAppStore(g.flatMap((t) => t.c.platforms))).map((g) => g[0].c.app)),
+  ];
   const storeMatch = new Map<string, AppUpdate | null>();
   const toSearch: string[] = [];
   for (const name of appNames) {
@@ -247,4 +256,4 @@ async function buildFeed(): Promise<Feed> {
   };
 }
 
-export const getFeed = unstable_cache(buildFeed, ["feed", "v1"], { revalidate: 1800 });
+export const getFeed = unstable_cache(buildFeed, ["feed", "v2"], { revalidate: 1800 });
