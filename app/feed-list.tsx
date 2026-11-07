@@ -128,8 +128,8 @@ export default function FeedList({ feed }: { feed: Feed }) {
       </div>
 
       <p className="meta">
-        {total} update{total === 1 ? "" : "s"} · AI read {stats.articlesClassified} articles from {stats.feedsOk} feeds ·{" "}
-        updated{" "}
+        {total} update{total === 1 ? "" : "s"} · Jev judged {stats.articlesClassified} articles from {stats.feedsOk} feeds
+        {stats.escalated > 0 && ` (${stats.escalated} re-checked)`} · updated{" "}
         <time dateTime={checkedAt} title={fmt.full.format(new Date(checkedAt))}>
           {relative(checkedAt, now)}
         </time>
@@ -152,9 +152,11 @@ export default function FeedList({ feed }: { feed: Feed }) {
       ))}
 
       <footer>
-        Confidence combines an AI read of each article (via Vercel AI Gateway), whether it&apos;s from the company itself, how many
-        outlets report it, and whether the App Store shows a matching release. Times are when the update was first reported, or
-        Apple&apos;s release time for App Store entries.
+        Confidence is the probability that an update is real and live. Jev (TypeSafe AI&apos;s decision model, via Vercel AI
+        Gateway) judges every article: is it an app update, and is it shipped, rolling out, in beta, announced or a rumor? When
+        Jev is unsure, the gateway re-asks Claude Sonnet. Independent sources are combined, official blogs count most, and a
+        matching App Store release adds to it. Times are when the update was first reported, or Apple&apos;s release time for
+        App Store entries.
       </footer>
     </>
   );
@@ -187,7 +189,7 @@ function Row({
             <span className="line">{i.summary || i.company}</span>
           </span>
           <span className="right">
-            <span className={`badge ${i.level}`} title={`Confidence ${i.confidence}/100`}>
+            <span className={`badge ${i.level}`} title={`${i.confidence}% confidence`}>
               <span className="dot" />
               {i.confidence}
             </span>
@@ -225,14 +227,12 @@ function Row({
 
           <div className="signals">
             <span className="label">
-              Confidence {i.confidence}/100 · {i.level}
+              {i.kind === "reported" ? `${i.confidence}% likely this update is real and live` : `Confidence ${i.confidence}%`} · {i.level}
             </span>
             <ul>
               {i.signals.map((s) => (
                 <li key={s.label}>
-                  <span className={s.points > 0 ? "pos" : s.points < 0 ? "neg" : "zero"}>
-                    {s.points > 0 ? `+${s.points}` : s.points}
-                  </span>
+                  <span className={s.tone}>{s.value}</span>
                   {s.label}
                 </li>
               ))}

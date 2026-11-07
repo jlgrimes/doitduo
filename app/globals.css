@@ -106,9 +106,9 @@ summary img, .avatar {
 .times dt { color: var(--muted); }
 .times dd { margin: 0; }
 
-.signals .label { color: var(--muted); display: block; margin-bottom: 4px; text-transform: capitalize; }
+.signals .label { color: var(--muted); display: block; margin-bottom: 4px; }
 .signals li { display: flex; gap: 8px; }
-.signals li span { width: 32px; flex: none; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.signals li span { width: 40px; flex: none; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
 .pos { color: var(--high); }
 .neg { color: var(--low); }
 .zero { color: var(--muted); }

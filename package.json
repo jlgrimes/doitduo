@@ -8,6 +8,7 @@
     "start": "next start"
   },
   "dependencies": {
+    "@ai-sdk/gateway": "^4.0.138",
     "ai": "^7.0.165",
     "fast-xml-parser": "^5.12.0",
     "next": "16.4.5",

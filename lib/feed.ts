@@ -1,13 +1,14 @@
-// Builds the feed: articles -> AI classification -> grouped per app ->
-// App Store cross-check -> confidence score.
+// Builds the feed: articles -> Jev decisions + extraction -> grouped per app ->
+// App Store cross-check -> confidence (a probability that the update is real
+// and live).
 
 import { unstable_cache } from "next/cache";
 import { getUpdates, searchApps, type AppUpdate } from "./apple";
 import { getCandidateArticles, type Article } from "./articles";
-import { classifyAll, type Classification } from "./classify";
+import { classifyAll, STATUSES, type Extraction, type Judgment, type Status } from "./classify";
 import type { SourceKind } from "./sources";
 
-export type Signal = { label: string; points: number };
+export type Signal = { label: string; value: string; tone: "pos" | "neg" | "zero" };
 export type Level = "high" | "medium" | "low";
 
 export type FeedItem = {
@@ -17,7 +18,7 @@ export type FeedItem = {
   company: string;
   summary: string;
   version: string;
-  status: Classification["status"] | "app_store";
+  status: Status | "app_store";
   platforms: string[];
   /** Sort/display time: when the update was first reported, or App Store release time. */
   time: string;
@@ -37,6 +38,7 @@ export type Feed = {
     feedsFailed: string[];
     articlesScanned: number;
     articlesClassified: number;
+    escalated: number;
     aiFailed: number;
     appsTracked: number;
   };
@@ -75,46 +77,70 @@ function namesMatch(storeName: string, appName: string) {
 const couldBeOnAppStore = (platforms: string[]) =>
   platforms.length === 0 || platforms.some((p) => p === "ios" || p === "other");
 
-// ---------- scoring ----------
+// ---------- confidence ----------
+//
+// For each article, Jev gives P(it reports an app update) and a probability
+// for each release status. The article's evidence that a real update is live:
+//
+//   p = P(update) × (P(shipped) + P(rolling out) + ½·P(beta)) × source weight
+//
+// Articles from different publishers count as independent evidence and are
+// combined with a noisy-OR: 1 − Π(1 − p). A matching App Store release then
+// closes part of the remaining doubt.
 
-const STATUS_POINTS: Record<Classification["status"], [number, string]> = {
-  shipped: [15, "Says it's available now"],
-  rolling_out: [10, "Says it's rolling out"],
-  beta: [-5, "Beta / test build only"],
-  announced: [-10, "Announced, not shipped yet"],
-  rumor: [-25, "Rumor or leak"],
-  not_an_update: [-40, "Not an update"],
-};
-const STATUS_RANK = ["shipped", "rolling_out", "beta", "announced", "rumor", "not_an_update"] as const;
+const SOURCE_WEIGHT: Record<SourceKind, number> = { "first-party": 1, news: 0.9, aggregator: 0.75 };
+const APPSTORE_WEIGHT = 0.6;
 
+const pLive = (j: Judgment) => j.status.shipped + j.status.rolling_out + 0.5 * j.status.beta;
+const pct = (p: number) => `${Math.round(p * 100)}%`;
 const level = (c: number): Level => (c >= 75 ? "high" : c >= 50 ? "medium" : "low");
-const clamp = (n: number) => Math.max(0, Math.min(100, Math.round(n)));
 
-type Tagged = { article: Article; c: Classification };
+type Tagged = { article: Article; j: Judgment; x: Extraction };
 
-function score(group: Tagged[], appStoreHit: boolean, appStore: AppUpdate | null) {
-  const signals: Signal[] = [];
-  const maxConf = Math.max(...group.map((g) => g.c.confidence));
-  signals.push({ label: `AI read: ${Math.round(maxConf * 100)}% sure it's a real update`, points: Math.round(maxConf * 50) });
+function score(group: Tagged[], appStoreHit: AppUpdate | null) {
+  // Best evidence per publisher (reposts on one outlet aren't independent).
+  const perPublisher = new Map<string, { t: Tagged; p: number }>();
+  for (const t of group) {
+    const p = t.j.pUpdate * pLive(t.j) * SOURCE_WEIGHT[t.article.sourceKind];
+    const k = t.article.source.toLowerCase();
+    if (!perPublisher.has(k) || perPublisher.get(k)!.p < p) perPublisher.set(k, { t, p });
+  }
+  const evidence = [...perPublisher.values()].sort((a, b) => b.p - a.p);
 
-  const best = STATUS_RANK.find((s) => group.some((g) => g.c.status === s))!;
-  const [sp, sl] = STATUS_POINTS[best];
-  signals.push({ label: sl, points: sp });
+  let doubt = evidence.reduce((d, e) => d * (1 - e.p), 1);
+  const fromArticles = 1 - doubt;
 
-  const kinds = new Set<SourceKind>(group.map((g) => g.article.sourceKind));
-  if (kinds.has("first-party")) signals.push({ label: "From the company's own blog/changelog", points: 20 });
-  else if (kinds.has("news")) signals.push({ label: "Reported by tech press", points: 5 });
-  else signals.push({ label: "Only found via search/aggregators", points: 0 });
+  const signals: Signal[] = evidence.slice(0, 5).map(({ t, p }) => ({
+    label:
+      `${t.article.source}${t.article.sourceKind === "first-party" ? " (official)" : ""}: ` +
+      `Jev says ${pct(t.j.pUpdate)} an app update, ${pct(pLive(t.j))} live` +
+      (t.j.escalated ? " · re-checked by Claude Sonnet" : ""),
+    value: pct(p),
+    tone: p >= 0.5 ? "pos" : p >= 0.2 ? "zero" : "neg",
+  }));
+  if (evidence.length > 5) signals.push({ label: `+${evidence.length - 5} more sources`, value: "", tone: "zero" });
 
-  const publishers = new Set(group.map((g) => g.article.source.toLowerCase()));
-  if (publishers.size > 1)
-    signals.push({ label: `${publishers.size} independent sources`, points: Math.min(16, (publishers.size - 1) * 8) });
+  if (appStoreHit) {
+    const maxUpdate = Math.max(...group.map((g) => g.j.pUpdate));
+    const before = 1 - doubt;
+    doubt *= 1 - APPSTORE_WEIGHT * maxUpdate;
+    signals.push({
+      label: `App Store shows v${appStoreHit.version} released around the same time`,
+      value: `+${Math.round((1 - doubt - before) * 100)}`,
+      tone: "pos",
+    });
+  }
 
-  if (appStoreHit && appStore)
-    signals.push({ label: `App Store shows a new version (v${appStore.version}) around the same time`, points: 20 });
+  const confidence = Math.round((1 - doubt) * 100);
+  if (evidence.length > 1)
+    signals.push({ label: `Combined across ${evidence.length} independent sources`, value: pct(fromArticles), tone: "zero" });
 
-  const confidence = clamp(signals.reduce((s, x) => s + x.points, 0));
-  return { signals, confidence, status: best };
+  // Most likely status, weighting each article by its evidence.
+  const totals = Object.fromEntries(STATUSES.map((s) => [s, 0])) as Record<Status, number>;
+  for (const t of group) for (const s of STATUSES) totals[s] += t.j.status[s] * t.j.pUpdate;
+  const status = STATUSES.reduce((a, b) => (totals[b] > totals[a] ? b : a));
+
+  return { signals, confidence, status };
 }
 
 // ---------- pipeline ----------
@@ -127,14 +153,16 @@ async function buildFeed(): Promise<Feed> {
 
   const { results, failed } = await classifyAll(articles);
 
-  const tagged: Tagged[] = articles
-    .map((article) => ({ article, c: results.get(article.id)! }))
-    .filter((t) => t.c && t.c.isAppUpdate && t.c.app.trim() && t.c.status !== "not_an_update");
+  const tagged: Tagged[] = articles.flatMap((article) => {
+    const r = results.get(article.id);
+    if (!r?.extraction || !r.extraction.app.trim()) return [];
+    return [{ article, j: r.judgment, x: r.extraction }];
+  });
 
   // Group by app, then split into separate updates when reports are > 3 days apart.
   const byApp = new Map<string, Tagged[]>();
   for (const t of tagged) {
-    const k = normalizeName(t.c.app);
+    const k = normalizeName(t.x.app);
     if (!k) continue;
     if (!byApp.has(k)) byApp.set(k, []);
     byApp.get(k)!.push(t);
@@ -156,7 +184,7 @@ async function buildFeed(): Promise<Feed> {
 
   // App Store lookup per app: chart pool first, then search (capped).
   const appNames = [
-    ...new Set(groups.filter((g) => couldBeOnAppStore(g.flatMap((t) => t.c.platforms))).map((g) => g[0].c.app)),
+    ...new Set(groups.filter((g) => couldBeOnAppStore(g.flatMap((t) => t.x.platforms))).map((g) => g[0].x.app)),
   ];
   const storeMatch = new Map<string, AppUpdate | null>();
   const toSearch: string[] = [];
@@ -184,34 +212,38 @@ async function buildFeed(): Promise<Feed> {
   const reported: FeedItem[] = groups.map((group) => {
     const first = group[0];
     const firstAt = Date.parse(first.article.publishedAt);
-    const store = storeMatch.get(first.c.app) ?? null;
+    const store = storeMatch.get(first.x.app) ?? null;
     const rel = store ? Date.parse(store.releasedAt) : NaN;
-    // New App Store version within 5 days before / 3 days after first report
+    // New App Store version within 5 days before / 3 days after the first report
     const appStoreHit = !!store && rel >= firstAt - 5 * DAY && rel <= firstAt + 3 * DAY;
     if (store && appStoreHit) matchedStoreIds.add(store.id);
 
-    const { signals, confidence, status } = score(group, appStoreHit, store);
+    const { signals, confidence, status } = score(group, appStoreHit ? store : null);
     const lead =
       group.find((g) => g.article.sourceKind === "first-party") ??
-      [...group].sort((a, b) => b.c.confidence - a.c.confidence)[0];
+      [...group].sort((a, b) => b.j.pUpdate * pLive(b.j) - a.j.pUpdate * pLive(a.j))[0];
 
     return {
-      key: `r:${normalizeName(first.c.app)}:${first.article.id}`,
+      key: `r:${normalizeName(first.x.app)}:${first.article.id}`,
       kind: "reported",
-      app: lead.c.app,
-      company: lead.c.company,
-      summary: lead.c.summary,
-      version: group.map((g) => g.c.version).find(Boolean) ?? (appStoreHit ? store!.version : ""),
+      app: lead.x.app,
+      company: lead.x.company,
+      summary: lead.x.summary,
+      version: group.map((g) => g.x.version).find(Boolean) ?? (appStoreHit ? store!.version : ""),
       status,
-      platforms: [...new Set(group.flatMap((g) => g.c.platforms))],
+      platforms: [...new Set(group.flatMap((g) => g.x.platforms))],
       time: first.article.publishedAt,
       firstReportedAt: first.article.publishedAt,
       appStore: store
         ? { name: store.name, version: store.version, releasedAt: store.releasedAt, url: store.url, icon: store.icon, notes: store.notes }
         : null,
-      articles: [...group]
-        .sort((a, b) => Date.parse(a.article.publishedAt) - Date.parse(b.article.publishedAt))
-        .map(({ article: a }) => ({ title: a.title, url: a.url, source: a.source, sourceKind: a.sourceKind, publishedAt: a.publishedAt })),
+      articles: group.map(({ article: a }) => ({
+        title: a.title,
+        url: a.url,
+        source: a.source,
+        sourceKind: a.sourceKind,
+        publishedAt: a.publishedAt,
+      })),
       confidence,
       level: level(confidence),
       signals,
@@ -235,9 +267,9 @@ async function buildFeed(): Promise<Feed> {
       firstReportedAt: null,
       appStore: { name: u.name, version: u.version, releasedAt: u.releasedAt, url: u.url, icon: u.icon, notes: u.notes },
       articles: [],
-      confidence: 95,
+      confidence: 99,
       level: "high",
-      signals: [{ label: "Version and release time come straight from Apple's App Store", points: 95 }],
+      signals: [{ label: "Version and release time come straight from Apple's App Store", value: "99%", tone: "pos" }],
     }));
 
   const items = [...reported, ...storeOnly].sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
@@ -250,10 +282,11 @@ async function buildFeed(): Promise<Feed> {
       feedsFailed,
       articlesScanned: articles.length,
       articlesClassified: results.size,
+      escalated: [...results.values()].filter((r) => r.judgment.escalated).length,
       aiFailed: failed,
       appsTracked: chart.appsScanned,
     },
   };
 }
 
-export const getFeed = unstable_cache(buildFeed, ["feed", "v2"], { revalidate: 1800 });
+export const getFeed = unstable_cache(buildFeed, ["feed", "jev-v1"], { revalidate: 1800 });
