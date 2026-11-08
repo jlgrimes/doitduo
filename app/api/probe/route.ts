@@ -1,7 +1,9 @@
 // TEMPORARY: inspect how App Store data exposes iPhone Duo support. Removed after.
 export const dynamic = "force-dynamic";
+export const maxDuration = 120;
 
-const snippets = (text: string, re: RegExp, n = 10, pad = 160) => {
+const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15";
+const snippets = (text: string, re: RegExp, n = 12, pad = 200) => {
   const out: string[] = [];
   for (const m of text.matchAll(re)) {
     out.push(text.slice(Math.max(0, m.index! - pad), m.index! + m[0].length + pad).replace(/\s+/g, " "));
@@ -10,44 +12,47 @@ const snippets = (text: string, re: RegExp, n = 10, pad = 160) => {
   return out;
 };
 
+type R = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+
 export async function GET(req: Request) {
-  const id = new URL(req.url).searchParams.get("id") ?? "";
+  const sp = new URL(req.url).searchParams;
+  const mode = sp.get("mode");
+
+  if (mode === "chart") {
+    // Correlate iPhoneDuo in supportedDevices with update date / min OS across chart apps.
+    const feed = (await (await fetch("https://rss.marketingtools.apple.com/api/v2/us/apps/top-free/100/apps.json", { cache: "no-store" })).json()) as R;
+    const ids = (feed.feed.results as R[]).map((r) => r.id).join(",");
+    const lk = (await (await fetch(`https://itunes.apple.com/lookup?country=us&entity=software&id=${ids}`, { cache: "no-store" })).json()) as R;
+    const rows = (lk.results as R[]).map((r) => ({
+      name: String(r.trackName).slice(0, 28),
+      duo: (r.supportedDevices as string[]).includes("iPhoneDuo-iPhoneDuo"),
+      updated: r.currentVersionReleaseDate,
+      minOS: r.minimumOsVersion,
+      notesDuo: /duo/i.test(r.releaseNotes ?? "") ? String(r.releaseNotes).match(/.{0,80}duo.{0,80}/i)?.[0] : null,
+      lastDevice: (r.supportedDevices as string[]).at(-1),
+    }));
+    return Response.json({
+      total: rows.length,
+      withDuo: rows.filter((r) => r.duo).length,
+      withDuoUpdatedBeforeOct5: rows.filter((r) => r.duo && r.updated < "2026-10-05").length,
+      withoutDuoUpdatedAfterOct5: rows.filter((r) => !r.duo && r.updated >= "2026-10-05").length,
+      rows,
+    });
+  }
+
+  const id = sp.get("id") ?? "";
   if (!/^\d{5,12}$/.test(id)) return Response.json({ error: "id" }, { status: 400 });
-
-  const lookupRes = await fetch(`https://itunes.apple.com/lookup?id=${id}&country=us&entity=software`, { cache: "no-store" });
-  const lookup = (await lookupRes.json()) as { results?: Record<string, unknown>[] };
-  const r = lookup.results?.[0] ?? {};
-  const duoFields = Object.fromEntries(
-    Object.entries(r).filter(([k, v]) => /duo|fold/i.test(k) || /duo|fold/i.test(JSON.stringify(v))),
-  );
-
-  const pageRes = await fetch(`https://apps.apple.com/us/app/id${id}`, {
-    cache: "no-store",
-    headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15", "Accept-Language": "en-US" },
-    redirect: "follow",
-  });
+  const pageRes = await fetch(`https://apps.apple.com/us/app/id${id}`, { cache: "no-store", headers: { "User-Agent": UA, "Accept-Language": "en-US" } });
   const page = await pageRes.text();
-
+  const m = page.match(/<script[^>]*id="serialized-server-data"[^>]*>([\s\S]*?)<\/script>/);
+  const data = m?.[1] ?? "";
   return Response.json({
-    lookup: {
-      keys: Object.keys(r),
-      features: r.features,
-      supportedDevicesDuo: (r.supportedDevices as string[] | undefined)?.filter((d) => /duo|fold/i.test(d)),
-      supportedDevicesSample: (r.supportedDevices as string[] | undefined)?.slice(-8),
-      screenshotKeys: Object.keys(r).filter((k) => /screenshot/i.test(k)).map((k) => [k, (r[k] as unknown[])?.length]),
-      duoFields,
-      version: r.version,
-      currentVersionReleaseDate: r.currentVersionReleaseDate,
-    },
-    page: {
-      status: pageRes.status,
-      url: pageRes.url,
-      length: page.length,
-      duoCount: (page.match(/iPhone Duo/gi) ?? []).length,
-      duoSnippets: snippets(page, /iPhone\s?Duo/gi),
-      madeFor: snippets(page, /Made for/gi, 5),
-      versionHistory: snippets(page, /versionHistory|Version History/g, 3, 400),
-      scriptIds: [...page.matchAll(/<script[^>]*id="([^"]+)"/g)].map((m) => m[1]),
-    },
+    status: pageRes.status,
+    duoAny: (page.match(/duo/gi) ?? []).length,
+    duoSnippets: snippets(page, /duo/gi),
+    serializedLen: data.length,
+    screenshotKeys: [...new Set([...data.matchAll(/"(\w*[Ss]creenshot\w*|\w*[Dd]evice[Ff]amil\w*|mediaType|screenshotPlatform|platform)"\s*:\s*"?([^",{\[]{0,40})/g)].map((x) => `${x[1]}=${x[2]}`))].slice(0, 60),
+    badgeLike: snippets(data, /badge|Made for|optimized/gi, 10, 150),
+    versionHistorySample: snippets(data, /versionHistory/g, 2, 600),
   });
 }
