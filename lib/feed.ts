@@ -1,56 +1,97 @@
-// Builds the feed: articles -> Jev decisions + extraction -> grouped per app ->
-// App Store cross-check -> confidence (a probability that the update is real
-// and live).
+// Which App Store apps work with iPhone Duo, and since when.
+//
+// 1. Pool: a few thousand popular apps (top charts, overall and per category).
+// 2. Only apps updated since Oct 5, 2026 (when Apple opened iPhone Duo
+//    submissions) can have shipped Duo support.
+// 3. Release notes that mention Duo (current version, plus version history from
+//    the App Store page) are judged by Jev: does this version support iPhone Duo?
+// 4. News/blog articles about apps adding Duo support are judged by Jev, the
+//    apps they name are matched to App Store listings, and Jev confirms each match.
+// 5. Evidence is combined into a confidence score; the timestamp is the release
+//    time of the first version whose notes announce Duo support (or the first
+//    article, if the notes never say so).
 
 import { unstable_cache } from "next/cache";
-import { getUpdates, searchApps, type AppUpdate } from "./apple";
+import { getAppPool, getRecentVersions, searchApps, type App, type VersionEntry } from "./apple";
 import { getCandidateArticles, type Article } from "./articles";
-import { classifyAll, confirmListing, STATUSES, type Extraction, type Judgment, type Status } from "./classify";
+import {
+  confirmListing,
+  extractArticleApps,
+  judgeArticle,
+  judgeReleaseNotes,
+  MENTIONS_DUO,
+  pool,
+  SUPPORT_LEVEL_KEYS,
+  type DuoJudgment,
+  type SupportLevel,
+} from "./classify";
 import type { SourceKind } from "./sources";
 
-export type Signal = { label: string; value: string; tone: "pos" | "neg" | "zero" };
+export const DUO_SUBMISSIONS_OPENED = "2026-10-05T00:00:00Z";
+const HISTORY_TIME_BUDGET_MS = 120_000; // per refresh; the rest is picked up next time
+const MAX_APP_SEARCHES = 40;
+
 export type Level = "high" | "medium" | "low";
 
-export type FeedItem = {
-  key: string;
-  kind: "reported" | "appstore";
-  app: string;
-  company: string;
-  summary: string;
-  version: string;
-  status: Status | "app_store";
-  platforms: string[];
-  /** Sort/display time: when the update was first reported, or App Store release time. */
-  time: string;
-  firstReportedAt: string | null;
-  appStore: Pick<AppUpdate, "name" | "version" | "releasedAt" | "url" | "icon" | "notes"> | null;
-  articles: Pick<Article, "title" | "url" | "source" | "sourceKind" | "publishedAt">[];
+export type Evidence =
+  | {
+      kind: "release-notes";
+      version: string;
+      at: string;
+      quote: string;
+      p: number;
+      pSupport: number;
+      level: SupportLevel;
+      escalated: boolean;
+    }
+  | {
+      kind: "news";
+      title: string;
+      url: string;
+      source: string;
+      sourceKind: SourceKind;
+      at: string;
+      p: number;
+      pSupport: number;
+      pSameApp: number;
+      level: SupportLevel;
+      escalated: boolean;
+    };
+
+export type DuoApp = {
+  id: number;
+  name: string;
+  developer: string;
+  genre: string;
+  icon: string;
+  url: string;
+  currentVersion: string;
+  /** When Duo support shipped: release time of the first Duo version, else the first report. */
+  duoSince: string;
+  /** First version whose release notes announce Duo support, if any. */
+  duoVersion: string | null;
+  level: SupportLevel;
   confidence: number; // 0–100
-  level: Level;
-  signals: Signal[];
+  tier: Level;
+  evidence: Evidence[];
 };
 
-export type Feed = {
-  items: FeedItem[];
+export type DuoFeed = {
+  apps: DuoApp[];
   checkedAt: string;
   stats: {
-    feedsOk: number;
-    feedsFailed: string[];
-    articlesScanned: number;
-    articlesClassified: number;
+    appsInPool: number;
+    appsEligible: number;
+    historiesScanned: number;
+    notesJudged: number;
+    articlesJudged: number;
     escalated: number;
     aiFailed: number;
-    appsTracked: number;
+    feedsOk: number;
   };
 };
 
-const DAY = 864e5;
-const CLUSTER_GAP = 3 * DAY;
-const APPSTORE_WINDOW = 7 * DAY;
-const MAX_APP_SEARCHES = 80;
-const MIN_SAME_APP = 0.5; // Jev must be at least this sure the listing is the app
-
-// ---------- name matching ----------
+// ---------- helpers ----------
 
 export function normalizeName(s: string) {
   return s
@@ -62,11 +103,7 @@ export function normalizeName(s: string) {
     .trim();
 }
 
-/**
- * Does an App Store listing name refer to the app named in an article?
- * The store name may add words ("WhatsApp Messenger" for "WhatsApp"), but the
- * article's app may not ("GitHub Copilot code review" is not the "GitHub" app).
- */
+/** The store name may extend the news name ("Canva" -> "Canva AI Photo..."), not the reverse. */
 function namesMatch(storeName: string, appName: string) {
   const store = normalizeName(storeName);
   const app = normalizeName(appName);
@@ -74,265 +111,198 @@ function namesMatch(storeName: string, appName: string) {
   return store === app || (app.length >= 4 && store.startsWith(app + " "));
 }
 
-// ---------- confidence ----------
-//
-// For each article, Jev gives P(it reports an app update) and a probability
-// for each release status. The article's evidence that a real update is live:
-//
-//   p = P(update) × (P(shipped) + P(rolling out) + ½·P(beta)) × source weight
-//
-// Articles from different publishers count as independent evidence and are
-// combined with a noisy-OR: 1 − Π(1 − p). A matching App Store release then
-// closes part of the remaining doubt.
-
 const SOURCE_WEIGHT: Record<SourceKind, number> = { "first-party": 1, news: 0.9, aggregator: 0.75 };
-const APPSTORE_WEIGHT = 0.6;
+const RELEASE_NOTES_WEIGHT = 0.97; // the developer's own statement
 
-const pLive = (j: Judgment) => j.status.shipped + j.status.rolling_out + 0.5 * j.status.beta;
-const pct = (p: number) => `${Math.round(p * 100)}%`;
-const level = (c: number): Level => (c >= 75 ? "high" : c >= 50 ? "medium" : "low");
+/** How strongly a judgment says "this app works with iPhone Duo now". */
+const strength = (j: DuoJudgment) =>
+  j.pSupport * (j.level.optimized + 0.7 * j.level.improved + 0.3 * j.level.fix_only);
 
-type Tagged = { article: Article; j: Judgment; x: Extraction };
+const topLevel = (j: DuoJudgment) => SUPPORT_LEVEL_KEYS.reduce((a, b) => (j.level[b] > j.level[a] ? b : a));
 
-/** The group's app name: the shortest one, i.e. the parent app after merging. */
-const appNameOf = (group: Tagged[]) => group.map((t) => t.x.app).sort((a, b) => a.length - b.length)[0];
-
-function score(group: Tagged[], appStoreHit: AppUpdate | null) {
-  // Best evidence per publisher (reposts on one outlet aren't independent).
-  const perPublisher = new Map<string, { t: Tagged; p: number }>();
-  for (const t of group) {
-    const p = t.j.pUpdate * pLive(t.j) * SOURCE_WEIGHT[t.article.sourceKind];
-    const k = t.article.source.toLowerCase();
-    if (!perPublisher.has(k) || perPublisher.get(k)!.p < p) perPublisher.set(k, { t, p });
-  }
-  const evidence = [...perPublisher.values()].sort((a, b) => b.p - a.p);
-
-  let doubt = evidence.reduce((d, e) => d * (1 - e.p), 1);
-  const fromArticles = 1 - doubt;
-
-  const signals: Signal[] = evidence.slice(0, 5).map(({ t, p }) => ({
-    label:
-      `${t.article.source}${t.article.sourceKind === "first-party" ? " (official)" : ""}: ` +
-      `Jev says ${pct(t.j.pUpdate)} an app update, ${pct(pLive(t.j))} live` +
-      (t.j.escalated ? " · re-checked by Claude Sonnet" : ""),
-    value: pct(p),
-    tone: p >= 0.5 ? "pos" : p >= 0.2 ? "zero" : "neg",
-  }));
-  if (evidence.length > 5) signals.push({ label: `+${evidence.length - 5} more sources`, value: "", tone: "zero" });
-
-  if (appStoreHit) {
-    const maxUpdate = Math.max(...group.map((g) => g.j.pUpdate));
-    const before = 1 - doubt;
-    doubt *= 1 - APPSTORE_WEIGHT * maxUpdate;
-    signals.push({
-      label: `App Store shows v${appStoreHit.version} released around the same time`,
-      value: `+${Math.round((1 - doubt - before) * 100)}`,
-      tone: "pos",
-    });
-  }
-
-  const confidence = Math.round((1 - doubt) * 100);
-  if (evidence.length > 1)
-    signals.push({ label: `Combined across ${evidence.length} independent sources`, value: pct(fromArticles), tone: "zero" });
-
-  // Most likely status, weighting each article by its evidence.
-  const totals = Object.fromEntries(STATUSES.map((s) => [s, 0])) as Record<Status, number>;
-  for (const t of group) for (const s of STATUSES) totals[s] += t.j.status[s] * t.j.pUpdate;
-  const status = STATUSES.reduce((a, b) => (totals[b] > totals[a] ? b : a));
-
-  return { signals, confidence, status };
+/** The sentence of the notes that mentions Duo. */
+function duoQuote(notes: string) {
+  const sentences = notes.split(/(?<=[.!?])\s+|\n+/);
+  const hit = sentences.find((s) => MENTIONS_DUO.test(s)) ?? notes;
+  return hit.trim().slice(0, 220);
 }
 
 // ---------- pipeline ----------
 
-async function buildFeed(): Promise<Feed> {
-  const [{ articles, feedsOk, feedsFailed }, chart] = await Promise.all([
-    getCandidateArticles(),
-    getUpdates().catch(() => ({ updates: [] as AppUpdate[], appsScanned: 0 })),
-  ]);
+async function buildFeed(): Promise<DuoFeed> {
+  const started = Date.now();
+  const [apps, { articles, feedsOk }] = await Promise.all([getAppPool(), getCandidateArticles()]);
+  const byId = new Map(apps.map((a) => [a.id, a]));
+  const eligible = apps
+    .filter((a) => a.releasedAt >= DUO_SUBMISSIONS_OPENED)
+    .sort((a, b) => Date.parse(b.releasedAt) - Date.parse(a.releasedAt));
 
-  const { results, failed } = await classifyAll(articles);
+  // Release notes that mention Duo, keyed app+version.
+  const noteCandidates = new Map<string, { app: App; entry: VersionEntry }>();
+  const addNotes = (app: App, entry: VersionEntry) => {
+    if (entry.releasedAt >= DUO_SUBMISSIONS_OPENED && MENTIONS_DUO.test(entry.notes))
+      noteCandidates.set(`${app.id}@${entry.version}`, { app, entry });
+  };
+  for (const app of eligible) addNotes(app, { version: app.version, releasedAt: app.releasedAt, notes: app.notes });
 
-  const tagged: Tagged[] = articles.flatMap((article) => {
-    const r = results.get(article.id);
-    if (!r?.extraction || !r.extraction.app.trim()) return [];
-    return [{ article, j: r.judgment, x: r.extraction }];
-  });
+  // Version history: catches apps that announced Duo support in an earlier
+  // version. Cached per app version, so after warm-up only apps that shipped
+  // a new version are re-fetched.
+  let historiesScanned = 0;
+  const historyDeadline = started + HISTORY_TIME_BUDGET_MS;
+  const scanHistory = async (app: App) => {
+    if (Date.now() > historyDeadline) return;
+    const versions = await getRecentVersions(app, DUO_SUBMISSIONS_OPENED);
+    historiesScanned++;
+    for (const v of versions) addNotes(app, v);
+  };
+  await pool(eligible, 12, scanHistory);
 
-  // Group by app, then split into separate updates when reports are > 3 days apart.
-  const byApp = new Map<string, Tagged[]>();
-  for (const t of tagged) {
-    const k = normalizeName(t.x.app);
-    if (!k) continue;
-    if (!byApp.has(k)) byApp.set(k, []);
-    byApp.get(k)!.push(t);
-  }
-  // Merge feature-named apps into their parent from the same company
-  // ("Claude Personal Finance" -> "Claude"). A parent named after the company
-  // itself is skipped, so "Google Maps" doesn't fold into "Google", and so is
-  // any name that is its own App Store app ("Apple Music Classical").
-  const storeNames = new Set(chart.updates.map((u) => normalizeName(u.name)));
-  const companyOf = (list: Tagged[]) =>
-    normalizeName(list.find((t) => t.x.company)?.x.company ?? "").split(" ")[0] ?? "";
-  for (const k of [...byApp.keys()].sort((a, b) => b.length - a.length)) {
-    const co = companyOf(byApp.get(k)!);
-    if (!co || storeNames.has(k)) continue;
-    const parent = [...byApp.keys()]
-      .filter((p) => p !== k && p.length >= 3 && k.startsWith(p + " ") && p !== co)
-      .sort((a, b) => b.length - a.length)
-      .find((p) => companyOf(byApp.get(p)!) === co);
-    if (parent) {
-      byApp.get(parent)!.push(...byApp.get(k)!);
-      byApp.delete(k);
-    }
-  }
+  // News: which articles report Duo support, and for which apps.
+  const judgedArticles = await pool(articles, 10, async (a) => ({ a, j: await judgeArticle(a) }));
+  const reporting = judgedArticles.results.filter((r): r is { a: Article; j: DuoJudgment } => !!r && strength(r.j) >= 0.3);
+  const named = await pool(reporting, 8, async ({ a, j }) => ({ a, j, apps: await extractArticleApps(a) }));
 
-  const groups: Tagged[][] = [];
-  for (const list of byApp.values()) {
-    list.sort((a, b) => Date.parse(a.article.publishedAt) - Date.parse(b.article.publishedAt));
-    let cur: Tagged[] = [];
-    for (const t of list) {
-      const last = cur.at(-1);
-      if (last && Date.parse(t.article.publishedAt) - Date.parse(last.article.publishedAt) > CLUSTER_GAP) {
-        groups.push(cur);
-        cur = [];
-      }
-      cur.push(t);
-    }
-    if (cur.length) groups.push(cur);
-  }
+  const newsHits: { a: Article; j: DuoJudgment; app: string; company: string }[] = [];
+  for (const r of named.results) if (r) for (const x of r.apps) newsHits.push({ a: r.a, j: r.j, app: x.app, company: x.company });
 
-  // Only App Store apps are shown. Find each app's listing: chart pool first,
-  // then App Store search (capped).
-  const appNames = [...new Set(groups.map(appNameOf))];
-  const storeMatch = new Map<string, AppUpdate | null>();
+  // Match named apps to App Store listings (pool first, then search), then have Jev confirm.
+  const listingFor = new Map<string, App | null>();
   const toSearch: string[] = [];
-  for (const name of appNames) {
-    const hit = chart.updates.find((u) => namesMatch(u.name, name));
-    if (hit) storeMatch.set(name, hit);
+  for (const name of new Set(newsHits.map((h) => h.app))) {
+    const hit = apps.find((u) => namesMatch(u.name, name));
+    if (hit) listingFor.set(name, hit);
     else toSearch.push(name);
   }
-  let si = 0;
-  await Promise.all(
-    Array.from({ length: 4 }, async () => {
-      while (si < Math.min(toSearch.length, MAX_APP_SEARCHES)) {
-        const name = toSearch[si++];
-        try {
-          const found = await searchApps(name);
-          storeMatch.set(name, found.find((u) => namesMatch(u.name, name)) ?? null);
-        } catch {
-          storeMatch.set(name, null);
-        }
-      }
-    }),
-  );
-
-  // Have Jev confirm each listing is really the app the news is about, so
-  // "iOS" or "Windows 11" can't match some unrelated app with a similar name.
-  const listed: { group: Tagged[]; store: AppUpdate; pSame: number }[] = [];
-  let gi = 0;
-  await Promise.all(
-    Array.from({ length: 8 }, async () => {
-      while (gi < groups.length) {
-        const group = groups[gi++];
-        const store = storeMatch.get(appNameOf(group));
-        if (!store) continue;
-        const lead = group[0];
-        try {
-          const pSame = await confirmListing(
-            { app: appNameOf(group), company: lead.x.company, summary: lead.x.summary, headline: lead.article.title },
-            { id: store.id, name: store.name, developer: store.developer, genre: store.genre },
-          );
-          if (pSame >= MIN_SAME_APP) listed.push({ group, store, pSame });
-        } catch (e) {
-          console.warn(`listing check failed for ${store.name}:`, e instanceof Error ? e.message : e);
-        }
-      }
-    }),
-  );
-
-  const matchedStoreIds = new Set<number>();
-  const reported: FeedItem[] = listed.map(({ group, store, pSame }) => {
-    const first = group[0];
-    const firstAt = Date.parse(first.article.publishedAt);
-    const appName = appNameOf(group);
-    const rel = store ? Date.parse(store.releasedAt) : NaN;
-    // New App Store version within 5 days before / 3 days after the first report
-    const appStoreHit = rel >= firstAt - 5 * DAY && rel <= firstAt + 3 * DAY;
-    if (appStoreHit) matchedStoreIds.add(store.id);
-
-    const { signals, confidence, status } = score(group, appStoreHit ? store : null);
-    signals.push({
-      label: `Jev: ${pct(pSame)} sure the App Store app is "${store.name}" by ${store.developer}`,
-      value: "",
-      tone: "zero",
-    });
-    const lead =
-      group.find((g) => g.article.sourceKind === "first-party") ??
-      [...group].sort((a, b) => b.j.pUpdate * pLive(b.j) - a.j.pUpdate * pLive(a.j))[0];
-
-    return {
-      key: `r:${normalizeName(appName)}:${first.article.id}`,
-      kind: "reported",
-      app: appName,
-      company: lead.x.company,
-      summary: lead.x.summary,
-      version: group.map((g) => g.x.version).find(Boolean) ?? (appStoreHit ? store.version : ""),
-      status,
-      platforms: [...new Set(group.flatMap((g) => g.x.platforms))],
-      time: first.article.publishedAt,
-      firstReportedAt: first.article.publishedAt,
-      appStore: { name: store.name, version: store.version, releasedAt: store.releasedAt, url: store.url, icon: store.icon, notes: store.notes },
-      articles: group.map(({ article: a }) => ({
-        title: a.title,
-        url: a.url,
-        source: a.source,
-        sourceKind: a.sourceKind,
-        publishedAt: a.publishedAt,
-      })),
-      confidence,
-      level: level(confidence),
-      signals,
-    };
+  await pool(toSearch.slice(0, MAX_APP_SEARCHES), 4, async (name) => {
+    const found = await searchApps(name);
+    const hit = found.find((u) => namesMatch(u.name, name)) ?? null;
+    listingFor.set(name, hit);
+    if (hit && !byId.has(hit.id)) byId.set(hit.id, hit);
   });
 
-  // App Store-only updates (no articles), straight from Apple.
-  const now = Date.now();
-  const storeOnly: FeedItem[] = chart.updates
-    .filter((u) => !matchedStoreIds.has(u.id) && now - Date.parse(u.releasedAt) <= APPSTORE_WINDOW)
-    .map((u) => ({
-      key: `a:${u.id}`,
-      kind: "appstore",
-      app: u.name,
-      company: u.developer,
-      summary: u.notes.split("\n").find((l) => l.trim())?.trim().slice(0, 140) ?? "",
-      version: u.version,
-      status: "app_store",
-      platforms: ["ios"],
-      time: u.releasedAt,
-      firstReportedAt: null,
-      appStore: { name: u.name, version: u.version, releasedAt: u.releasedAt, url: u.url, icon: u.icon, notes: u.notes },
-      articles: [],
-      confidence: 99,
-      level: "high",
-      signals: [{ label: "Version and release time come straight from Apple's App Store", value: "99%", tone: "pos" }],
-    }));
+  const newsEvidence = new Map<number, Evidence[]>();
+  const confirmed = await pool(newsHits, 8, async (h) => {
+    const listing = listingFor.get(h.app);
+    if (!listing) return null;
+    const pSameApp = await confirmListing({ app: h.app, company: h.company, headline: h.a.title }, listing);
+    return { h, listing, pSameApp };
+  });
+  for (const c of confirmed.results) {
+    if (!c || c.pSameApp < 0.5) continue;
+    const { h, listing, pSameApp } = c;
+    const ev: Evidence = {
+      kind: "news",
+      title: h.a.title,
+      url: h.a.url,
+      source: h.a.source,
+      sourceKind: h.a.sourceKind,
+      at: h.a.publishedAt,
+      p: strength(h.j) * SOURCE_WEIGHT[h.a.sourceKind] * pSameApp,
+      pSupport: h.j.pSupport,
+      pSameApp,
+      level: topLevel(h.j),
+      escalated: h.j.escalated,
+    };
+    const list = newsEvidence.get(listing.id) ?? [];
+    if (!list.some((e) => e.kind === "news" && e.url === ev.url)) list.push(ev);
+    newsEvidence.set(listing.id, list);
+  }
 
-  const items = [...reported, ...storeOnly].sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+  // Apps found through news but outside the pool: check their history too.
+  await pool(
+    [...newsEvidence.keys()].map((id) => byId.get(id)!).filter((a) => a && !eligible.includes(a)),
+    6,
+    async (app) => {
+      addNotes(app, { version: app.version, releasedAt: app.releasedAt, notes: app.notes });
+      for (const v of await getRecentVersions(app, DUO_SUBMISSIONS_OPENED)) addNotes(app, v);
+    },
+  );
+
+  // Jev reads every release note that mentions Duo.
+  const judgedNotes = await pool([...noteCandidates.values()], 10, async ({ app, entry }) => ({
+    app,
+    entry,
+    j: await judgeReleaseNotes(app, entry),
+  }));
+
+  const notesEvidence = new Map<number, Evidence[]>();
+  for (const r of judgedNotes.results) {
+    if (!r) continue;
+    const list = notesEvidence.get(r.app.id) ?? [];
+    list.push({
+      kind: "release-notes",
+      version: r.entry.version,
+      at: r.entry.releasedAt,
+      quote: duoQuote(r.entry.notes),
+      p: strength(r.j) * RELEASE_NOTES_WEIGHT,
+      pSupport: r.j.pSupport,
+      level: topLevel(r.j),
+      escalated: r.j.escalated,
+    });
+    notesEvidence.set(r.app.id, list);
+  }
+
+  // Combine per app.
+  const duoApps: DuoApp[] = [];
+  for (const id of new Set([...notesEvidence.keys(), ...newsEvidence.keys()])) {
+    const app = byId.get(id);
+    if (!app) continue;
+    const evidence = [...(notesEvidence.get(id) ?? []), ...(newsEvidence.get(id) ?? [])].sort(
+      (a, b) => Date.parse(a.at) - Date.parse(b.at),
+    );
+    // Independent sources: best evidence per publisher; release notes count once.
+    const best = new Map<string, number>();
+    for (const e of evidence) {
+      const k = e.kind === "news" ? `news:${e.source.toLowerCase()}` : "notes";
+      best.set(k, Math.max(best.get(k) ?? 0, e.p));
+    }
+    const confidence = Math.round((1 - [...best.values()].reduce((d, p) => d * (1 - p), 1)) * 100);
+    if (confidence < 10) continue; // e.g. only Duolingo-owl mentions
+
+    const firstNotes = evidence.find((e) => e.kind === "release-notes" && e.p >= 0.5);
+    const firstAny = evidence.find((e) => e.p >= 0.5) ?? evidence.reduce((a, b) => (b.p > a.p ? b : a));
+    const since = firstNotes ?? firstAny;
+    const strongest = evidence.reduce((a, b) => (b.p > a.p ? b : a));
+
+    duoApps.push({
+      id,
+      name: app.name,
+      developer: app.developer,
+      genre: app.genre,
+      icon: app.icon,
+      url: app.url,
+      currentVersion: app.version,
+      duoSince: since.at,
+      duoVersion: firstNotes?.kind === "release-notes" ? firstNotes.version : null,
+      level: strongest.level,
+      confidence,
+      tier: confidence >= 75 ? "high" : confidence >= 50 ? "medium" : "low",
+      evidence,
+    });
+  }
+  duoApps.sort((a, b) => Date.parse(b.duoSince) - Date.parse(a.duoSince));
+
+  const failed = judgedNotes.failed + judgedArticles.failed + named.failed + confirmed.failed;
+  const firstError = judgedNotes.firstError ?? judgedArticles.firstError ?? named.firstError ?? confirmed.firstError;
+  if (failed) console.error(`AI step failed ${failed} times. First error: ${firstError}`);
 
   return {
-    items,
+    apps: duoApps,
     checkedAt: new Date().toISOString(),
     stats: {
-      feedsOk,
-      feedsFailed,
-      articlesScanned: articles.length,
-      articlesClassified: results.size,
-      escalated: [...results.values()].filter((r) => r.judgment.escalated).length,
+      appsInPool: apps.length,
+      appsEligible: eligible.length,
+      historiesScanned,
+      notesJudged: judgedNotes.results.filter(Boolean).length,
+      articlesJudged: judgedArticles.results.filter(Boolean).length,
+      escalated:
+        judgedNotes.results.filter((r) => r?.j.escalated).length +
+        judgedArticles.results.filter((r) => r?.j.escalated).length,
       aiFailed: failed,
-      appsTracked: chart.appsScanned,
+      feedsOk,
     },
   };
 }
 
-export const getFeed = unstable_cache(buildFeed, ["feed", "appstore-only-v1"], { revalidate: 1800 });
+export const getFeed = unstable_cache(buildFeed, ["duo-feed", "v1"], { revalidate: 1800 });

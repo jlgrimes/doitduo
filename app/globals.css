@@ -107,8 +107,11 @@ summary img, .avatar {
 .times dd { margin: 0; }
 
 .signals .label { color: var(--muted); display: block; margin-bottom: 4px; }
-.signals li { display: flex; gap: 8px; }
-.signals li span { width: 40px; flex: none; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.signals li { display: flex; gap: 8px; margin-bottom: 6px; }
+.signals .ev em { color: var(--muted); font-style: normal; display: block; font-size: 12px; }
+.signals .ev a { color: var(--fg); }
+.signals li > span:first-child { width: 40px; flex: none; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.signals li > .ev { flex: 1; min-width: 0; }
 .pos { color: var(--high); }
 .neg { color: var(--low); }
 .zero { color: var(--muted); }

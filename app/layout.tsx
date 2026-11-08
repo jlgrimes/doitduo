@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "App Updates",
-  description: "Updates to App Store apps, found in tech news and company blogs, with confidence scores.",
+  title: "Works with iPhone Duo",
+  description: "App Store apps that support iPhone Duo, and when they added it, with confidence scores.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

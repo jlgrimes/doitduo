@@ -1,164 +1,228 @@
 // AI layer, all through Vercel AI Gateway (OIDC auth on Vercel, or
-// AI_GATEWAY_API_KEY locally):
+// AI_GATEWAY_API_KEY locally).
 //
-// 1. Jev (TypeSafe AI's decision model, `typesafe-ai/jev`) answers typed
-//    questions about every article and returns real probabilities: is this an
-//    app update, and what's its release status. When Jev is unsure, AI Gateway
-//    automatically re-asks a stronger model (conditional decision fallback).
-// 2. A small language model extracts the app name, version and a one-line
-//    summary, only for articles Jev thinks are plausibly updates.
-//
-// Both results are cached per article, so each article is processed once.
+// Jev (TypeSafe AI's decision model, `typesafe-ai/jev`) answers typed
+// questions with real probabilities:
+//   - Do these release notes say this version supports iPhone Duo?
+//   - Does this article report that an app added iPhone Duo support?
+//   - Is this App Store listing the app the article means?
+// When Jev is unsure, AI Gateway re-asks a stronger model (conditional
+// decision fallback). A small language model only pulls app names out of
+// articles. Every result is cached, so each item is judged once.
 
 import type { GatewayProviderOptions } from "@ai-sdk/gateway";
 import { experimental_decide as decide, generateText, Output } from "ai";
 import { unstable_cache } from "next/cache";
 import { z } from "zod";
+import type { App, VersionEntry } from "./apple";
 import type { Article } from "./articles";
 
 export const DECISION_MODEL = process.env.DECISION_MODEL ?? "typesafe-ai/jev";
 export const ESCALATION_MODEL = "anthropic/claude-sonnet-5.5";
 const EXTRACT_MODEL = process.env.AI_MODEL ?? "anthropic/claude-haiku-5.5";
-const JUDGE_VERSION = "jev-v1"; // bump to re-run Jev on everything
-const EXTRACT_VERSION = "x-v2"; // bump to re-run extraction
-const CACHE_SECONDS = 14 * 86400;
-const MIN_P_UPDATE = 0.3; // below this we don't bother extracting
+const CACHE_SECONDS = 30 * 86400;
 
-// ---------- 1. Jev decisions ----------
+/** Cheap text filter: only text that passes this is sent to Jev. */
+export const MENTIONS_DUO = /\bduo\b|\bunfold|\bfoldable\b|\binner (display|screen)\b/i;
 
-const STATUS_CRITERIA = {
-  shipped: "Available to users now",
-  rolling_out: "Gradually reaching users now",
-  beta: "Only in beta, preview or test builds",
-  announced: "Announced, but coming later",
-  rumor: "A leak, code teardown, or 'reportedly working on' story",
-  not_an_update: "Not about an app or software update at all",
+const DUO_CONTEXT =
+  "iPhone Duo is Apple's foldable iPhone (launched Oct 23, 2026) with an outer screen and a large inner display. Apps can be optimized for it, e.g. layouts that use the unfolded inner display. Every app technically runs on it, so only an explicit statement of support or optimization counts. Other things called Duo (Duolingo's owl, Google Duo, Duo Security, 'duo' meaning two people) are unrelated.";
+
+const SUPPORT_LEVELS = {
+  optimized: "The app now supports or is optimized for iPhone Duo (layouts for the inner display, unfolded mode, etc.)",
+  improved: "Some iPhone Duo-specific improvements, but not described as full support",
+  fix_only: "Only fixes a bug or crash on iPhone Duo",
+  coming_later: "iPhone Duo support is planned or coming in a future version",
+  unrelated: "Not about iPhone Duo",
 } as const;
+export type SupportLevel = keyof typeof SUPPORT_LEVELS;
+export const SUPPORT_LEVEL_KEYS = Object.keys(SUPPORT_LEVELS) as SupportLevel[];
 
-export type Status = keyof typeof STATUS_CRITERIA;
-export const STATUSES = Object.keys(STATUS_CRITERIA) as Status[];
-
-const QUESTIONS = {
-  isAppUpdate: {
-    type: "boolean",
-    instructions:
-      "Does this article report a new version, feature, or change to a specific app or software product that users can get or will get?",
-    criteria: {
-      true: "A specific app or software product gained a new version or user-facing feature (shipped, rolling out, in beta, announced or rumored).",
-      false: "Hardware, company or business news, funding, policy, reviews, deals, how-tos, opinion, or anything not about a software update.",
-    },
-  },
-  status: {
-    type: "choice",
-    instructions: "What is the release status of the update the article describes?",
-    criteria: STATUS_CRITERIA,
-  },
-} as const;
-
-export type Judgment = {
-  pUpdate: number; // P(article reports an app update)
-  status: Record<Status, number>; // probability per status
-  model: string; // which model produced the answers
-  escalated: boolean; // Jev was unsure, so a stronger model re-decided
+export type DuoJudgment = {
+  pSupport: number; // P(the text says the app supports iPhone Duo now)
+  level: Record<SupportLevel, number>;
+  model: string;
+  escalated: boolean;
 };
 
-async function judgeUncached(a: Article): Promise<Judgment> {
-  const result = await decide({
-    model: DECISION_MODEL,
-    state: {
-      title: a.title,
-      publisher: a.source,
-      publisherType: a.sourceKind,
-      publishedAt: a.publishedAt,
-      url: a.url,
-      excerpt: a.snippet,
-    },
-    questions: QUESTIONS,
-    maxRetries: 1,
-    abortSignal: AbortSignal.timeout(30_000),
-    providerOptions: {
-      gateway: {
-        models: [
-          {
-            // Jev is unsure -> have a stronger model decide instead.
-            model: ESCALATION_MODEL,
-            when: {
-              any: [
-                { question: "isAppUpdate", probabilityBetween: [0.35, 0.65] },
-                { question: "status", confidenceBelow: 0.5 },
-              ],
-            },
-          },
-          ESCALATION_MODEL, // also used if Jev errors
-        ],
-      } satisfies GatewayProviderOptions<keyof typeof QUESTIONS>,
-    },
-  });
-
-  const s = result.answers.status;
-  // Language-model fallbacks may omit the distribution; treat their pick as certain.
-  const status = Object.fromEntries(
-    STATUSES.map((k) => [k, s.probabilities?.[k] ?? (s.choice === k ? 1 : 0)]),
-  ) as Record<Status, number>;
-
-  const model = result.response.modelId;
+// Escalate when Jev is unsure (probability near 0.5, or a low-confidence choice).
+function escalation<Q extends string>(boolQ: Q, choiceQ: Q) {
   return {
-    pUpdate: result.answers.isAppUpdate.probability,
-    status,
-    model,
-    escalated: !model.includes("jev"),
+    gateway: {
+      models: [
+        {
+          model: ESCALATION_MODEL,
+          when: {
+            any: [
+              { question: boolQ, probabilityBetween: [0.35, 0.65] },
+              { question: choiceQ, confidenceBelow: 0.5 },
+            ],
+          },
+        },
+        ESCALATION_MODEL, // also used if Jev errors
+      ],
+    } satisfies GatewayProviderOptions<Q>,
   };
 }
 
-// ---------- 2. Extraction ----------
-
-const Extraction = z.object({
-  app: z
-    .string()
-    .describe(
-      "The app or product itself, not the feature: 'Claude' (not 'Claude Personal Finance'), 'WhatsApp' (not 'WhatsApp message translation'), 'GitHub Copilot' (not 'Copilot code review'), 'Google Maps'. Empty if none.",
-    ),
-  company: z.string().describe("Company that makes it. Empty if unknown."),
-  platforms: z.array(z.enum(["ios", "android", "web", "mac", "windows", "linux", "other"])),
-  version: z.string().describe("Version number if stated, else empty."),
-  summary: z.string().describe("What changed, at most 110 characters. Plain and specific."),
-});
-export type Extraction = z.infer<typeof Extraction>;
-
-async function extractUncached(a: Article): Promise<Extraction> {
-  const { output } = await generateText({
-    model: EXTRACT_MODEL,
-    output: Output.object({ schema: Extraction }),
-    providerOptions: { gateway: { models: [ESCALATION_MODEL] } },
-    maxRetries: 1,
-    abortSignal: AbortSignal.timeout(30_000),
-    system: "Extract which app the article is about and what changed. Use only the given text.",
-    prompt: `Title: ${a.title}\nPublisher: ${a.source}\nExcerpt: ${a.snippet || "(none)"}`,
-  });
-  return output;
+function toJudgment(
+  p: number,
+  choice: { choice: SupportLevel; probabilities?: Record<SupportLevel, number> },
+  model: string,
+): DuoJudgment {
+  const level = Object.fromEntries(
+    SUPPORT_LEVEL_KEYS.map((k) => [k, choice.probabilities?.[k] ?? (choice.choice === k ? 1 : 0)]),
+  ) as Record<SupportLevel, number>;
+  return { pSupport: p, level, model, escalated: !model.includes("jev") };
 }
 
-// ---------- caching + batching ----------
+// ---------- release notes ----------
 
-const cached = <T>(kind: string, version: string, a: Article, fn: () => Promise<T>) =>
-  unstable_cache(fn, [kind, version, a.id], { revalidate: CACHE_SECONDS })();
+const NOTES_QUESTIONS = {
+  supportsDuo: {
+    type: "boolean",
+    instructions: `Do these release notes say that this version of the app supports, or is optimized for, iPhone Duo? ${DUO_CONTEXT}`,
+  },
+  level: {
+    type: "choice",
+    instructions: "What do the release notes say about iPhone Duo?",
+    criteria: SUPPORT_LEVELS,
+  },
+} as const;
 
-export type Classified = { judgment: Judgment; extraction: Extraction | null };
+/** Jev's read of one version's release notes. Cached per app version. */
+export function judgeReleaseNotes(app: App, entry: VersionEntry): Promise<DuoJudgment> {
+  return unstable_cache(
+    async () => {
+      const r = await decide({
+        model: DECISION_MODEL,
+        state: {
+          app: app.name,
+          developer: app.developer,
+          version: entry.version,
+          releasedAt: entry.releasedAt,
+          releaseNotes: entry.notes.slice(0, 4000),
+        },
+        questions: NOTES_QUESTIONS,
+        maxRetries: 1,
+        abortSignal: AbortSignal.timeout(30_000),
+        providerOptions: escalation<keyof typeof NOTES_QUESTIONS>("supportsDuo", "level"),
+      });
+      return toJudgment(r.answers.supportsDuo.probability, r.answers.level, r.response.modelId);
+    },
+    ["notes-duo", "v1", String(app.id), entry.version],
+    { revalidate: CACHE_SECONDS },
+  )();
+}
 
-export async function classifyAll(articles: Article[], concurrency = 10) {
-  const out = new Map<string, Classified>();
+// ---------- articles ----------
+
+const ARTICLE_QUESTIONS = {
+  reportsSupport: {
+    type: "boolean",
+    instructions: `Does this article report that one or more specific apps now support, or have been optimized for, iPhone Duo? ${DUO_CONTEXT}`,
+  },
+  level: {
+    type: "choice",
+    instructions: "What does the article say about the apps' iPhone Duo support?",
+    criteria: SUPPORT_LEVELS,
+  },
+} as const;
+
+export function judgeArticle(a: Article): Promise<DuoJudgment> {
+  return unstable_cache(
+    async () => {
+      const r = await decide({
+        model: DECISION_MODEL,
+        state: { title: a.title, publisher: a.source, publisherType: a.sourceKind, publishedAt: a.publishedAt, excerpt: a.snippet },
+        questions: ARTICLE_QUESTIONS,
+        maxRetries: 1,
+        abortSignal: AbortSignal.timeout(30_000),
+        providerOptions: escalation<keyof typeof ARTICLE_QUESTIONS>("reportsSupport", "level"),
+      });
+      return toJudgment(r.answers.reportsSupport.probability, r.answers.level, r.response.modelId);
+    },
+    ["article-duo", "v1", a.id],
+    { revalidate: CACHE_SECONDS },
+  )();
+}
+
+const ArticleApps = z.object({
+  apps: z
+    .array(
+      z.object({
+        app: z.string().describe("The App Store app's name, e.g. 'Netflix', 'Canva', 'YouTube'"),
+        company: z.string().describe("Company that makes it, or empty"),
+      }),
+    )
+    .max(25)
+    .describe("Apps the article says support or were optimized for iPhone Duo. Empty if none."),
+});
+
+/** Which apps an article says support iPhone Duo. */
+export function extractArticleApps(a: Article): Promise<z.infer<typeof ArticleApps>["apps"]> {
+  return unstable_cache(
+    async () => {
+      const { output } = await generateText({
+        model: EXTRACT_MODEL,
+        output: Output.object({ schema: ArticleApps }),
+        providerOptions: { gateway: { models: [ESCALATION_MODEL] } },
+        maxRetries: 1,
+        abortSignal: AbortSignal.timeout(30_000),
+        system: `List the apps this article says now support or are optimized for iPhone Duo. ${DUO_CONTEXT} Use only the given text.`,
+        prompt: `Title: ${a.title}\nPublisher: ${a.source}\nExcerpt: ${a.snippet || "(none)"}`,
+      });
+      return output.apps.filter((x) => x.app.trim());
+    },
+    ["article-apps", "v1", a.id],
+    { revalidate: CACHE_SECONDS },
+  )();
+}
+
+// ---------- App Store listing check ----------
+
+const LISTING_QUESTIONS = {
+  sameApp: {
+    type: "boolean",
+    instructions:
+      "Is this App Store listing the app the news is about? A different app that merely shares a word in its name, an operating system, a website or a developer API does not count.",
+  },
+} as const;
+
+/** Jev's probability that an App Store listing is the app a news item names. */
+export function confirmListing(
+  news: { app: string; company: string; headline: string },
+  listing: Pick<App, "id" | "name" | "developer" | "genre">,
+): Promise<number> {
+  return unstable_cache(
+    async () => {
+      const r = await decide({
+        model: DECISION_MODEL,
+        state: { news, appStoreListing: listing },
+        questions: LISTING_QUESTIONS,
+        maxRetries: 1,
+        abortSignal: AbortSignal.timeout(30_000),
+        providerOptions: { gateway: { models: [ESCALATION_MODEL] } satisfies GatewayProviderOptions },
+      });
+      return r.answers.sameApp.probability;
+    },
+    ["listing", "v2", news.app.toLowerCase(), String(listing.id)],
+    { revalidate: CACHE_SECONDS },
+  )();
+}
+
+/** Run async work over items with limited concurrency; failures are counted, not thrown. */
+export async function pool<T, R>(items: T[], concurrency: number, fn: (t: T) => Promise<R>) {
+  const results: (R | undefined)[] = new Array(items.length);
   let failed = 0;
   let firstError: string | undefined;
   let i = 0;
   await Promise.all(
     Array.from({ length: concurrency }, async () => {
-      while (i < articles.length) {
-        const a = articles[i++];
+      while (i < items.length) {
+        const idx = i++;
         try {
-          const judgment = await cached("judge", JUDGE_VERSION, a, () => judgeUncached(a));
-          const extraction =
-            judgment.pUpdate >= MIN_P_UPDATE ? await cached("extract", EXTRACT_VERSION, a, () => extractUncached(a)) : null;
-          out.set(a.id, { judgment, extraction });
+          results[idx] = await fn(items[idx]);
         } catch (e) {
           failed++;
           firstError ??= e instanceof Error ? e.message : String(e);
@@ -166,41 +230,5 @@ export async function classifyAll(articles: Article[], concurrency = 10) {
       }
     }),
   );
-  if (failed) console.error(`AI step failed for ${failed}/${articles.length} articles. First error: ${firstError}`);
-  return { results: out, failed };
-}
-
-// ---------- 3. App Store listing check ----------
-
-const LISTING_QUESTIONS = {
-  sameApp: {
-    type: "boolean",
-    instructions:
-      "Is this App Store listing the app the news is about? A new feature inside that app counts. A different app that merely shares a word in its name, an operating system, a website, a desktop-only program or a developer API does not.",
-  },
-} as const;
-
-/**
- * Jev's probability that an App Store listing is the app an update is about.
- * Cached per (app, listing).
- */
-export function confirmListing(
-  update: { app: string; company: string; summary: string; headline: string },
-  listing: { id: number; name: string; developer: string; genre: string },
-): Promise<number> {
-  return unstable_cache(
-    async () => {
-      const result = await decide({
-        model: DECISION_MODEL,
-        state: { news: update, appStoreListing: listing },
-        questions: LISTING_QUESTIONS,
-        maxRetries: 1,
-        abortSignal: AbortSignal.timeout(30_000),
-        providerOptions: { gateway: { models: [ESCALATION_MODEL] } satisfies GatewayProviderOptions },
-      });
-      return result.answers.sameApp.probability;
-    },
-    ["listing", "v1", update.app.toLowerCase(), String(listing.id)],
-    { revalidate: CACHE_SECONDS },
-  )();
+  return { results, failed, firstError };
 }

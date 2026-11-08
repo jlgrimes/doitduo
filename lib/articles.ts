@@ -11,12 +11,11 @@ export type Article = {
   snippet: string;
 };
 
-const WINDOW_MS = 7 * 864e5;
+const SINCE = Date.parse("2026-09-01T00:00:00Z"); // iPhone Duo coverage starts here
 const MAX_CANDIDATES = 150; // caps AI cost per refresh
 
-// Cheap pre-filter before the AI looks at anything.
-const UPDATE_WORDS =
-  /\b(update[sd]?|release[sd]?|version|v\d+(\.\d+)+|roll(s|ing)? out|launch(es|ed)?|now available|ships?|adds?|new features?|changelog|redesign(ed)?|introduc(es|ing)|available (now|today))\b/i;
+// Cheap pre-filter before the AI looks at anything: must mention iPhone Duo.
+const DUO_WORDS = /iphone\s?duo|\bduo\b.{0,60}\b(app|apps|support|optimi[sz]ed|inner (display|screen)|unfold)/i;
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -111,7 +110,6 @@ export async function getCandidateArticles(): Promise<{
   const feedsFailed: string[] = [];
   const seen = new Set<string>();
   const seenTitles = new Set<string>();
-  const now = Date.now();
   const articles: Article[] = [];
 
   results.forEach((r, i) => {
@@ -123,8 +121,8 @@ export async function getCandidateArticles(): Promise<{
     for (const a of r.value) {
       const titleKey = a.title.toLowerCase().replace(/\W+/g, " ").trim();
       if (seen.has(a.id) || seenTitles.has(titleKey)) continue;
-      if (now - Date.parse(a.publishedAt) > WINDOW_MS) continue;
-      if (!UPDATE_WORDS.test(`${a.title} ${a.snippet.slice(0, 200)}`)) continue;
+      if (Date.parse(a.publishedAt) < SINCE) continue;
+      if (!DUO_WORDS.test(`${a.title} ${a.snippet}`)) continue;
       seen.add(a.id);
       seenTitles.add(titleKey);
       articles.push(a);

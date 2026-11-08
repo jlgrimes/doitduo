@@ -1,4 +1,4 @@
-// Where we look for app-update articles. Add or remove feeds freely; any feed
+// Where we look for articles about apps adding iPhone Duo support. Add or remove feeds freely; any feed
 // that fails to load is skipped.
 //
 // kind:
@@ -36,8 +36,9 @@ export const SOURCES: Source[] = [
   { name: "Duolingo Blog", url: "https://blog.duolingo.com/rss/", kind: "first-party" },
   { name: "Slack iOS Release Notes", url: "https://slack.com/release-notes/ios/rss", kind: "first-party" },
 
-  // Web-wide search
-  { name: "Google News", url: googleNews('app "new update" when:3d'), kind: "aggregator" },
-  { name: "Google News", url: googleNews('app "rolling out" when:3d'), kind: "aggregator" },
-  { name: "Google News", url: googleNews('app "latest version" OR "now available" when:3d'), kind: "aggregator" },
+  // Web-wide search for iPhone Duo app support
+  { name: "Google News", url: googleNews('"iPhone Duo" app support'), kind: "aggregator" },
+  { name: "Google News", url: googleNews('"optimized for iPhone Duo"'), kind: "aggregator" },
+  { name: "Google News", url: googleNews('"Made for iPhone Duo"'), kind: "aggregator" },
+  { name: "Google News", url: googleNews('"iPhone Duo" update adds'), kind: "aggregator" },
 ];

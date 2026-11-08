@@ -1,23 +1,21 @@
-# App Updates
+# Works with iPhone Duo
 
-A minimal Next.js site that finds updates to App Store apps across the web and shows when each one shipped, with a confidence score.
+A minimal Next.js site that tracks which App Store apps have shipped **iPhone Duo** support, and exactly when.
+
+Every app runs on iPhone Duo (Apple's foldable, launched Oct 23, 2026), and the App Store lists `iPhoneDuo` as a supported device for all of them, so that tells you nothing. What matters is whether the developer actually built support for it. This site looks for explicit evidence of that.
 
 ## How it works
 
-1. **Collect.** Pulls ~20 RSS/Atom feeds (`lib/sources.ts`): tech press (9to5Mac, The Verge, Android Police…), company blogs and changelogs (GitHub, OpenAI, Spotify…), and Google News searches. Articles from the last 7 days that mention update-ish words become candidates.
-2. **Decide (Jev).** Every candidate article goes to **Jev**, TypeSafe AI's decision model (`typesafe-ai/jev`), through **Vercel AI Gateway** (`lib/classify.ts`). Jev answers typed questions with real probabilities: *is this an app update?* (boolean) and *what's its status?* (shipped / rolling out / beta / announced / rumor). When Jev is unsure (P between 0.35 and 0.65, or status confidence under 0.5), the gateway's conditional decision fallback re-asks Claude Sonnet.
-3. **Extract.** For articles Jev rates at least 30% likely to be an update, Claude Haiku pulls out the app name, version, platforms and a one-line summary.
-4. **App Store apps only.** Reports about the same app within 3 days are merged into one update. Each app is looked up on the App Store (top charts, then search), and Jev confirms the listing really is that app. Updates with no confirmed listing (OS updates, websites, desktop software, APIs) are dropped. The listing is also used to check whether a new version shipped around the same time.
-5. **Confidence.** Each article's evidence is `P(update) × P(shipped or rolling out, + half of beta) × source weight` (official blog 1.0, press 0.9, aggregator 0.75). Independent publishers are combined with a noisy-OR, and a matching App Store release closes part of the remaining doubt. The result is the probability that the update is real and live: 75%+ is High, 50%+ Medium.
+1. **App pool.** Top charts from the App Store, overall and for every category (a few thousand popular apps), via Apple's public feeds and the iTunes lookup API (`lib/apple.ts`).
+2. **Only apps that could have it.** Apple opened iPhone Duo submissions on Oct 5, 2026, so only apps updated since then are checked.
+3. **Release notes.** For each of those apps, the current release notes and the version history embedded in its App Store page (notes, version and exact release time for every version) are scanned for mentions of Duo. Version histories are cached per app version, so after the first pass only apps that ship a new version are re-fetched.
+4. **Jev decides.** Every release note or news article that mentions Duo is judged by **Jev**, TypeSafe AI's decision model (`typesafe-ai/jev`), through **Vercel AI Gateway** (`lib/classify.ts`). It answers with probabilities: *does this say the app supports iPhone Duo?* and *is it full optimization, some improvements, only a bug fix, or "coming later"?* That filters out Duolingo's owl, Duo Security and "Duo support coming soon". When Jev is unsure, the gateway's conditional fallback re-asks Claude Sonnet.
+5. **News.** Tech press, company blogs and Google News searches for iPhone Duo app support (`lib/sources.ts`). Articles Jev says report Duo support have their apps extracted by Claude Haiku, matched to App Store listings, and Jev confirms each match.
+6. **Confidence and timestamp** (`lib/feed.ts`). Each piece of evidence counts as `P(supports Duo) × (optimized + 0.7·improved + 0.3·fix only) × weight` (release notes 0.97, official blog 1.0, press 0.9, search results 0.75, news also × P(right app)). Independent sources combine with a noisy-OR. The timestamp is the release time of the first version whose notes announce Duo support, or the first article if the notes never mention it.
 
-All AI results are cached per article for 14 days, so each article is only processed once.
+`/` is the list; `/api/updates` is the same data as JSON. The feed refreshes every 30 minutes; each refresh scans up to two minutes' worth of not-yet-cached version histories, so coverage grows over the first few refreshes.
 
-App Store releases with no news coverage are listed separately under **App Store**, using Apple's own release timestamp.
-
-- `/` — the feed (filters: source, time range, minimum confidence)
-- `/api/updates` — the same data as JSON
-
-The feed is cached for 30 minutes.
+**Limits:** apps that support Duo without saying so in their release notes or in the news won't appear. Apple's "Made for iPhone Duo" badge isn't exposed in the App Store's page data yet, so it can't be checked.
 
 ## AI Gateway
 
