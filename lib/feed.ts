@@ -156,7 +156,7 @@ async function buildFeed(): Promise<DuoFeed> {
     historiesScanned++;
     for (const v of versions) addNotes(app, v);
   };
-  await pool(eligible, 12, scanHistory);
+  await pool(eligible, 24, scanHistory);
 
   // News: which articles report Duo support, and for which apps.
   const judgedArticles = await pool(articles, 10, async (a) => ({ a, j: await judgeArticle(a) }));
