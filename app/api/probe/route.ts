@@ -50,9 +50,9 @@ export async function GET(req: Request) {
     const json = JSON.parse(data.replace(/&quot;/g, '"').replace(/&amp;/g, "&"));
     const found: R[] = [];
     const walk = (o: unknown, path: string) => {
-      if (found.length >= 4 || !o || typeof o !== "object") return;
+      if (found.length >= 6 || !o || typeof o !== "object") return;
       const r = o as R;
-      if (r.$kind === "TitledParagraph" && path.includes("versionHistory")) {
+      if (r.$kind === "TitledParagraph") {
         found.push({ path: path.slice(-160), keys: Object.keys(r), ...Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === "string" ? v.slice(0, 120) : v])) });
       }
       for (const [k, v] of Object.entries(r)) walk(v, `${path}.${k}`);
